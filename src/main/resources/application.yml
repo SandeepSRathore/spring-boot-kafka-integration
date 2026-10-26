@@ -1,0 +1,33 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: kafka-lab
+
+  kafka:
+    bootstrap-servers: localhost:9092
+
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      # Java object -> JSON bytes. Also adds a "__TypeId__" header so consumers know which class to build.
+      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer
+      acks: all            # wait until the broker has safely stored the message
+
+    consumer:
+      # Where a NEW consumer group starts reading: earliest = from the beginning of the topic
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # ErrorHandlingDeserializer wraps the real JSON deserializer, so a bad message ("poison pill")
+      # becomes an error we can handle instead of crashing the consumer in an endless loop.
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      properties:
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JacksonJsonDeserializer
+        spring.json.trusted.packages: com.example.kafkalab.events
+
+logging:
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [%-28.28thread] %-22.22logger{0} : %msg%n"
+  level:
+    org.apache.kafka: WARN           # the Kafka client is very chatty at INFO
+    org.springframework.kafka: INFO  # keeps "partitions assigned/revoked" logs visible
