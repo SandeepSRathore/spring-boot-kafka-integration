@@ -24,9 +24,15 @@ import org.springframework.kafka.support.KafkaHeaders;
 import org.springframework.kafka.test.EmbeddedKafkaBroker;
 import org.springframework.kafka.test.context.EmbeddedKafka;
 import org.springframework.kafka.test.utils.KafkaTestUtils;
+import org.springframework.mail.SimpleMailMessage;
+import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.verify;
 
 /**
  * Runs the whole app against an in-memory Kafka broker started by @EmbeddedKafka (no Docker needed).
@@ -49,6 +55,10 @@ class OrderFlowIntegrationTest {
 
     @Autowired
     private EmbeddedKafkaBroker broker;
+
+    // No SMTP server in tests: replace the real mail sender with a mock and check what it was asked to send
+    @MockitoBean
+    private JavaMailSender mailSender;
 
     @Test
     void orderIsConfirmedWhenStockAndMoneyAreAvailable() {
@@ -120,6 +130,18 @@ class OrderFlowIntegrationTest {
 
         // Inventory never answered, so the order is stuck
         assertThat(orderService.findById(order.id())).map(Order::status).contains(OrderStatus.PLACED);
+    }
+
+    @Test
+    void deadLetterSendsAnEmailAlert() {
+        Order order = orderService.placeOrder(new OrderRequest("CRASH", 1, 10));
+
+        // The DLT listener reacts asynchronously, so give it time (retries alone take ~2 seconds)
+        verify(mailSender, timeout(30_000)).send(argThat((SimpleMailMessage mail) ->
+                mail.getSubject().contains(order.id())
+                        && mail.getSubject().contains(Topics.ORDERS_DLT)
+                        && mail.getText().contains("Simulated failure")
+                        && mail.getText().contains("inventory-service")));
     }
 
     // ---------------------------------------------------------------- helpers

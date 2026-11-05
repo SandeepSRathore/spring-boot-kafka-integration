@@ -19,7 +19,7 @@ just like real microservices would. The business logic is kept tiny on purpose, 
         └───── COMPLETED / FAILED ── "payments" ◀─────────────────────────────────────────────────────┘
 
  NotificationService listens to ALL three topics and "emails" the customer.
- DeadLetterListener listens to orders.DLT / inventory.DLT / payments.DLT.
+ DeadLetterListener listens to orders.DLT / inventory.DLT / payments.DLT and emails an alert (Mailpit).
 ```
 
 | Order status     | When                                            |
@@ -43,6 +43,7 @@ just like real microservices would. The business logic is kept tiny on purpose, 
 | **Concurrency** (one thread per partition) | `concurrency = "3"` in `InventoryService` |
 | One listener on many topics + one topic with many event types | `notification/NotificationService.java` |
 | **Retries + Dead Letter Topic** | `config/KafkaErrorHandlingConfig.java`, `dlt/DeadLetterListener.java` |
+| Email alert for every DLT record (Mailpit) | `dlt/DeadLetterListener.java`, `spring.mail` in `application.yml` |
 | **Poison pill** handling (bad JSON) | `ErrorHandlingDeserializer` in `application.yml` |
 | Compensating action (undo a step when a later one fails) | `InventoryService.onPaymentEvent` |
 
@@ -51,9 +52,19 @@ just like real microservices would. The business logic is kept tiny on purpose, 
 Prerequisites: Java 25, Maven, Docker.
 
 ```bash
-docker compose up -d          # Kafka on localhost:9092, Kafka UI on http://localhost:8090
+docker compose up -d          # Kafka, Kafka UI and Mailpit
 mvn spring-boot:run           # the app on http://localhost:8080
 ```
+
+| What | Where |
+|---|---|
+| The app (REST API) | http://localhost:8080 |
+| Kafka broker | `localhost:9092` |
+| Kafka UI | http://localhost:8090 |
+| Mailpit inbox (DLT alert emails) | http://localhost:8025 (SMTP on `localhost:1025`) |
+
+Port 8080 already taken? Run `mvn spring-boot:run -Dspring-boot.run.arguments=--server.port=8095`
+and use that port in the `curl` commands below.
 
 Place some orders:
 
@@ -79,11 +90,56 @@ Then **read the app logs**: every line says which thread, topic, partition and o
 Also open **Kafka UI** at http://localhost:8090 to browse topics, messages (including headers like
 `__TypeId__`), partitions and consumer groups.
 
+Every message that ends up in a dead letter topic also sends an **email alert**: open the Mailpit
+inbox at http://localhost:8025 (see experiment 7).
+
 The Kafka CLI tools are inside the container, under `/opt/kafka/bin`:
 
 ```bash
 docker exec -it kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
 ```
+
+---
+
+## What it looks like
+
+Screenshots from one run: an order for each outcome, a `CRASH` order and `POST /orders/bulk?count=6`.
+(`orders.DLT` also holds two `CRASH` orders from before the app was restarted; orders live in memory, Kafka topics don't.)
+
+**The REST API.** `GET /orders` shows every outcome: `CONFIRMED`, `OUT_OF_STOCK`, `PAYMENT_FAILED`,
+and the `CRASH` order stuck in `PLACED` because its event ended up in the dead letter topic.
+
+![GET /orders](docs/screenshots/01-orders-api.png)
+
+`GET /inventory` shows the stock after the confirmed orders (the failed payment put its phone back):
+
+![GET /inventory](docs/screenshots/02-inventory-api.png)
+
+**Kafka UI: topics.** Each topic has 3 partitions, and every topic has a matching `.DLT` topic.
+Only `orders.DLT` holds messages: the `CRASH` orders.
+
+![Kafka UI topics](docs/screenshots/03-kafka-ui-topics.png)
+
+**Kafka UI: messages in `orders`.** The key is the `orderId`. Different keys spread over partitions
+0, 1 and 2, and offsets count up per partition.
+
+![Kafka UI orders messages](docs/screenshots/04-kafka-ui-orders-messages.png)
+
+**Kafka UI: consumer groups.** One group per service, each reading at its own pace. `inventory-service`
+has 4 members: 3 threads on `orders` (`concurrency = "3"`) and 1 on `payments`. Lag 0 = all caught up.
+
+![Kafka UI consumer groups](docs/screenshots/05-kafka-ui-consumer-groups.png)
+
+**Kafka UI: a dead letter.** The headers added by `DeadLetterPublishingRecoverer` say where the message
+came from and why it failed: original partition, exception class, message and stack trace.
+
+![Kafka UI DLT headers](docs/screenshots/06-kafka-ui-dlt-headers.png)
+
+**Mailpit: the alert email.** `DeadLetterListener` sends one email per dead letter.
+
+![Mailpit inbox](docs/screenshots/07-mailpit-inbox.png)
+
+![Mailpit DLT alert email](docs/screenshots/08-mailpit-dlt-alert.png)
 
 ---
 
@@ -157,6 +213,11 @@ curl -s -XPOST localhost:8080/orders -H 'Content-Type: application/json' \
    exception in its headers (look at them in Kafka UI).
 3. The consumer carries on with the next records. The order stays `PLACED` forever. In real life
    someone would inspect the DLT and fix or replay it.
+4. An `alert email sent` line: `DeadLetterListener` emailed the failure. Open the **Mailpit** inbox at
+   http://localhost:8025 to read it (topic, key, consumer group, error, payload). Mailpit catches all
+   mail, nothing leaves your machine. Sender and recipient are `kafkalab.dlt-alert.*` in `application.yml`.
+   If the email can't be sent (Mailpit stopped?), you get an `ERROR ... could not send alert email` log
+   line instead: the listener doesn't throw, so the DLT record isn't retried or dead-lettered again.
 
 Try: change the backoff in `KafkaErrorHandlingConfig`, or call
 `errorHandler.addNotRetryableExceptions(IllegalStateException.class)` to skip retries for errors that
@@ -197,15 +258,18 @@ mvn test        # no Docker needed: @EmbeddedKafka starts an in-memory broker
 
 `OrderFlowIntegrationTest` starts the whole app and checks each path through the order flow:
 confirmed, out of stock, payment failed (with the stock released), all events of an order on the same
-partition, and retries ending in `orders.DLT`. Ideas worth borrowing for your own Kafka tests:
+partition, retries ending in `orders.DLT`, and the email alert for a dead letter. Ideas worth borrowing
+for your own Kafka tests:
 - **Awaitility** (`await().untilAsserted(...)`): Kafka is asynchronous, so wait for the result instead of `Thread.sleep`.
 - A **plain test consumer** in its own group (`stringConsumer(...)`) reads topics as raw JSON to check keys, partitions and headers.
+- **`@MockitoBean JavaMailSender`** replaces the real mail sender, so no SMTP server is needed;
+  `verify(mailSender, timeout(30_000)).send(...)` waits for the asynchronous email.
 
 ---
 
 ## Reset everything
 ```bash
-docker compose down -v   # removes the Kafka container and all its data
+docker compose down -v   # removes the Kafka, Kafka UI and Mailpit containers and all their data
 ```
 
 ## Project layout
@@ -218,5 +282,5 @@ src/main/java/com/example/kafkalab
 ├── inventory/     consumes orders, produces inventory events
 ├── payment/       consumes inventory events, produces payment events
 ├── notification/  consumes everything, logs customer messages
-└── dlt/           reads the dead letter topics
+└── dlt/           reads the dead letter topics and emails an alert per record
 ```

@@ -30,6 +30,11 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-kafka</artifactId>
         </dependency>
+        <!-- Sends the DLT alert emails (to Mailpit when running locally) -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-mail</artifactId>
+        </dependency>
 
         <!-- Tests: JUnit 5, AssertJ, Spring test support + an embedded Kafka broker (no Docker needed) -->
         <dependency>

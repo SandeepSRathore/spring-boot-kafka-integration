@@ -32,3 +32,12 @@ services:
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:19092
     depends_on:
       - kafka
+
+  # Fake SMTP server that catches every email the app sends (nothing is really delivered).
+  # The app sends to localhost:1025; read the inbox at http://localhost:8025
+  mailpit:
+    image: axllent/mailpit:v1.27
+    container_name: mailpit
+    ports:
+      - "1025:1025"   # SMTP
+      - "8025:8025"   # web inbox
